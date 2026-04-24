@@ -16,7 +16,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 
 
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__parent)
 load_dotenv(ROOT_DIR / '.env')
 
 SUPABASE_URL = os.environ['SUPABASE_URL']
@@ -104,9 +104,14 @@ def get_current_user(
     return user
 
 
-# ========= Routes =========
-@api_router.get("/")
+# ========= Root Routes =========
+@app.get("/")
 def root():
+    return {"message": "Stokvel API is running"}
+
+
+@api_router.get("/")
+def api_root():
     return {"message": "Stokvel API"}
 
 
@@ -496,13 +501,19 @@ async def payfast_itn(request: Request):
 
 
 # ========= App wiring =========
+
+# Root endpoint for Render health check
+@app.get("/")
+def root():
+    return {"message": "Stokvel API is running"}
+
 app.include_router(api_router)
 
-# CORS - Updated with hardcoded values for reliability
+# CORS - Allow Render frontend and local development
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["http://localhost:3000", "http://localhost:8000"],
+    allow_origins=["https://stokvel-cafbf.web.app", "http://localhost:3000", "http://localhost:8000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -526,4 +537,5 @@ def backfill_user_fields():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
