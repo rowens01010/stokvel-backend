@@ -388,12 +388,12 @@ def payfast_initiate(payload: PayfastInitiatePayload, user: dict = Depends(get_c
         "return_url": payload.return_url,
         "cancel_url": payload.cancel_url,
         "m_payment_id": m_payment_id,
-        "amount": "1.9",
+        "amount": "25",
         "item_name": "Stokvel Premium (Monthly)",
         "email_address": user["email"],
         "subscription_type": "1",
         "billing_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "recurring_amount": "1.9",
+        "recurring_amount": "25",
         "frequency": "3",
         "cycles": "0",
     }
@@ -424,7 +424,7 @@ def payfast_activate_sandbox(user: dict = Depends(get_current_user)):
 
 
 BOOST_TOKENS = 3
-BOOST_PRICE = "0.49"
+BOOST_PRICE = "8"
 
 
 @api_router.post("/payments/payfast/boost/initiate")
