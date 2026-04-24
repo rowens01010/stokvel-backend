@@ -179,7 +179,7 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
         path="/",
         max_age=7 * 24 * 60 * 60,
     )
-    return {"ok": True, "user_id": user_id}
+    return {"ok": True, "user_id": user_id, "token": session_token}
 
 
 @api_router.get("/auth/me")
