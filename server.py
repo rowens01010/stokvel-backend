@@ -16,7 +16,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 
 
-ROOT_DIR = Path(__file__parent)
+ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 SUPABASE_URL = os.environ['SUPABASE_URL']
@@ -501,11 +501,6 @@ async def payfast_itn(request: Request):
 
 
 # ========= App wiring =========
-
-# Root endpoint for Render health check
-@app.get("/")
-def root():
-    return {"message": "Stokvel API is running"}
 
 app.include_router(api_router)
 
