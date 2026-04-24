@@ -504,12 +504,17 @@ async def payfast_itn(request: Request):
 
 app.include_router(api_router)
 
-# CORS - Allow Render frontend and local development
+# CORS - Allow Firebase frontend and local development
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=[
+        "https://stokvel-cafbf.firebaseapp.com",
+        "https://stokvel-cafbf.web.app",
+        "http://localhost:3000",
+        "http://localhost:8000"
+    ],
     allow_credentials=True,
-    allow_origins=["https://stokvel-cafbf.web.app", "http://localhost:3000", "http://localhost:8000"],
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
