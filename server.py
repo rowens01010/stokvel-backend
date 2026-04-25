@@ -14,10 +14,39 @@ from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone, timedelta
-
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
+import json
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# Initialize Firebase Admin SDK — tries file first, then env vars (for Render)
+try:
+    # Try loading from service account JSON file (local dev)
+    cred = credentials.Certificate(ROOT_DIR / 'firebase-service-account.json')
+    firebase_admin.initialize_app(cred)
+    logging.info("Firebase Admin SDK initialized from file")
+except Exception:
+    try:
+        # Fallback: load from environment variables (Render production)
+        firebase_creds = {
+            "type": os.environ.get("FIREBASE_TYPE", "service_account"),
+            "project_id": os.environ.get("FIREBASE_PROJECT_ID"),
+            "private_key_id": os.environ.get("FIREBASE_PRIVATE_KEY_ID"),
+            "private_key": os.environ.get("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n"),
+            "client_email": os.environ.get("FIREBASE_CLIENT_EMAIL"),
+            "client_id": os.environ.get("FIREBASE_CLIENT_ID"),
+            "auth_uri": os.environ.get("FIREBASE_AUTH_URI", "https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": os.environ.get("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": os.environ.get("FIREBASE_AUTH_PROVIDER_X509_CERT_URL", "https://www.googleapis.com/oauth2/v1/certs"),
+            "client_x509_cert_url": os.environ.get("FIREBASE_CLIENT_X509_CERT_URL"),
+        }
+        cred = credentials.Certificate(firebase_creds)
+        firebase_admin.initialize_app(cred)
+        logging.info("Firebase Admin SDK initialized from environment variables")
+    except Exception as e:
+        logging.warning(f"Firebase Admin SDK initialization failed: {e}")
 
 SUPABASE_URL = os.environ['SUPABASE_URL']
 SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
@@ -117,20 +146,37 @@ def api_root():
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
-    """Authenticate with Google ID token"""
+    """Authenticate with Google/Firebase ID token (works for web & native mobile)"""
     email = payload.email
     name = payload.name
     picture = payload.picture
     ref = payload.ref
-    
+
+    # Verify Firebase ID token (works for both web & native Capacitor)
+    verified_uid = None
+    try:
+        decoded = firebase_auth.verify_id_token(payload.id_token)
+        verified_uid = decoded.get('uid')
+        if decoded.get('email'):
+            email = decoded['email']
+        if decoded.get('name'):
+            name = decoded['name']
+        if decoded.get('picture'):
+            picture = decoded['picture']
+        logging.info(f"Firebase token verified for UID: {verified_uid}")
+    except Exception as e:
+        logging.warning(f"Firebase token verification failed: {e}")
+
     session_token = f"session_{uuid.uuid4().hex[:32]}"
-    
+
     existing = _maybe(sb.table("users").select("*").eq("email", email).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if existing:
         user_id = existing["user_id"]
         updates = {"name": name, "picture": picture}
+        if verified_uid:
+            updates["firebase_uid"] = verified_uid
         if not existing.get("referral_code"):
             updates["referral_code"] = uuid.uuid4().hex[:8]
         if existing.get("diamonds") is None:
@@ -147,7 +193,7 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
                 sb.table("users").update(
                     {"diamonds": (ref_user.get("diamonds") or 0) + 1}
                 ).eq("user_id", ref_user["user_id"]).execute()
-        sb.table("users").insert({
+        user_data = {
             "user_id": user_id,
             "email": email,
             "name": name,
@@ -160,7 +206,10 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
             "referral_code": referral_code,
             "referred_by": referred_by,
             "created_at": now_iso,
-        }).execute()
+        }
+        if verified_uid:
+            user_data["firebase_uid"] = verified_uid
+        sb.table("users").insert(user_data).execute()
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
