@@ -584,6 +584,7 @@ def backfill_user_fields():
         logger.warning("Backfill skipped: %s", e)
 
 
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
