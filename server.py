@@ -52,14 +52,14 @@ VOTE_COST_XLM = 0.07
 TOKENS_PER_VOTE = 1
 TOKENS_TO_CREATE_CARD = 5
 BUILT_IN_CARD_LIMIT = 20
-FREE_CARDS_PER_USER = 1  # Each user gets 1 free card
+FREE_CARDS_PER_USER = 1
 
 # Time marketplace constants
-DEFAULT_TIME_PRICE_XLM = 0.05  # Per minute
+DEFAULT_TIME_PRICE_XLM = 0.05
 TIME_PURCHASE_MIN_MINUTES = 10
 TIME_PURCHASE_MAX_MINUTES = 60
 
-# Track how many built-in cards have been replaced
+# Track built-in cards replaced
 built_in_cards_replaced = 0
 
 
@@ -78,14 +78,12 @@ def _parse_dt(value):
 
 
 def _maybe(res):
-    """Extract single-row data from a maybe_single() response (may be None)."""
     if res is None:
         return None
     return getattr(res, "data", None)
 
 
 def _check_stellar_balance(public_key: str) -> float:
-    """Check XLM balance of a Stellar account"""
     try:
         account = STELLAR_SERVER.accounts().account_id(public_key).call()
         for balance in account['balances']:
@@ -100,7 +98,6 @@ def _check_stellar_balance(public_key: str) -> float:
 
 
 def _create_stellar_keypair():
-    """Generate a new Stellar keypair"""
     keypair = Keypair.random()
     return {
         "public_key": keypair.public_key,
@@ -109,7 +106,6 @@ def _create_stellar_keypair():
 
 
 def _get_free_cards_count(user_id: str) -> int:
-    """Get how many free cards a user has used"""
     res = _maybe(sb.table("free_cards_used").select("*").eq("user_id", user_id).maybe_single().execute())
     if res:
         return res.get("cards_created", 0)
@@ -198,7 +194,6 @@ def api_root():
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
-    """Authenticate with Google ID token"""
     email = payload.email
     name = payload.name
     picture = payload.picture
@@ -233,7 +228,6 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
                     {"diamonds": (ref_user.get("diamonds") or 0) + 1}
                 ).eq("user_id", ref_user["user_id"]).execute()
         
-        # Generate Stellar wallet for new user
         stellar_keypair = _create_stellar_keypair()
         
         sb.table("users").insert({
@@ -255,7 +249,6 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
             "created_at": now_iso,
         }).execute()
         
-        # Initialize free card count
         sb.table("free_cards_used").insert({
             "user_id": user_id,
             "cards_created": 0,
@@ -281,148 +274,66 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
     return {"ok": True, "user_id": user_id, "token": session_token}
 
 
-# ========= Time Marketplace Routes =========
-
-@api_router.post("/marketplace/time/list")
-def create_time_listing(payload: TimeListingCreate, user: dict = Depends(get_current_user)):
-    """List your available card time for sale"""
-    if user.get("membership_type") != "crypto":
-        raise HTTPException(status_code=400, detail="Must be a crypto member to sell time")
+@api_router.get("/auth/me")
+def auth_me(user: dict = Depends(get_current_user)):
+    if user.get("is_premium") and user.get("premium_until"):
+        pu = _parse_dt(user["premium_until"])
+        if pu and pu < datetime.now(timezone.utc):
+            sb.table("users").update({"is_premium": False}).eq("user_id", user["user_id"]).execute()
+            user["is_premium"] = False
     
-    if payload.minutes_available < TIME_PURCHASE_MIN_MINUTES:
-        raise HTTPException(status_code=400, detail=f"Minimum {TIME_PURCHASE_MIN_MINUTES} minutes required")
-    
-    if payload.price_per_minute_xlm <= 0:
-        raise HTTPException(status_code=400, detail="Price must be greater than 0")
-    
-    total_price = payload.minutes_available * payload.price_per_minute_xlm
-    
-    listing = {
-        "listing_id": f"tlist_{uuid.uuid4().hex[:12]}",
-        "seller_id": user["user_id"],
-        "minutes_available": payload.minutes_available,
-        "price_per_minute_xlm": payload.price_per_minute_xlm,
-        "total_price_xlm": total_price,
-        "is_active": True,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    
-    sb.table("time_marketplace").insert(listing).execute()
+    xlm_balance = 0.0
+    if user.get("stellar_public_key"):
+        xlm_balance = _check_stellar_balance(user["stellar_public_key"])
     
     return {
-        "ok": True,
-        "listing": listing
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "name": user["name"],
+        "picture": user.get("picture", ""),
+        "tokens": user.get("tokens", 0),
+        "diamonds": user.get("diamonds", 0),
+        "is_premium": user.get("is_premium", False),
+        "premium_until": user.get("premium_until"),
+        "votes_since_token": user.get("votes_since_token", 0),
+        "votes_per_token": VOTES_PER_TOKEN,
+        "referral_code": user.get("referral_code"),
+        "diamond_boost_cost": DIAMOND_BOOST_COST,
+        "diamond_boost_minutes": DIAMOND_BOOST_MINUTES,
+        "membership_type": user.get("membership_type", "free"),
+        "has_paid_upgrade": user.get("has_paid_upgrade", False),
+        "stellar_public_key": user.get("stellar_public_key"),
+        "xlm_balance": xlm_balance,
     }
 
 
-@api_router.get("/marketplace/time/listings")
-def get_time_listings(user: dict = Depends(get_current_user)):
-    """Get all active time listings"""
-    res = sb.table("time_marketplace").select("*").eq("is_active", True).neq("seller_id", user["user_id"]).execute()
-    listings = res.data or []
-    
-    # Enrich with seller info
-    enriched = []
-    for listing in listings:
-        seller = _maybe(sb.table("users").select("name,stellar_public_key").eq("user_id", listing["seller_id"]).maybe_single().execute())
-        listing["seller_name"] = seller.get("name", "Unknown") if seller else "Unknown"
-        listing["seller_wallet"] = seller.get("stellar_public_key") if seller else None
-        enriched.append(listing)
-    
-    return {"listings": enriched}
+@api_router.post("/auth/logout")
+def auth_logout(
+    response: Response,
+    session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"),
+    authorization: Optional[str] = Header(default=None),
+):
+    token = session_token_cookie
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+    if token:
+        sb.table("user_sessions").delete().eq("session_token", token).execute()
+    response.delete_cookie(key="session_token", path="/", samesite="lax", secure=False)
+    return {"ok": True}
 
 
-@api_router.post("/marketplace/time/buy")
-def buy_time(payload: TimePurchasePayload, user: dict = Depends(get_current_user)):
-    """Purchase time for your card from the marketplace"""
-    if user.get("membership_type") != "crypto":
-        raise HTTPException(status_code=400, detail="Must be a crypto member to buy time")
-    
-    # Verify listing
-    listing = _maybe(sb.table("time_marketplace").select("*").eq("listing_id", payload.listing_id).maybe_single().execute())
-    if not listing:
-        raise HTTPException(status_code=404, detail="Listing not found")
-    
-    if not listing["is_active"]:
-        raise HTTPException(status_code=400, detail="Listing is no longer active")
-    
-    if payload.minutes_to_buy > listing["minutes_available"]:
-        raise HTTPException(status_code=400, detail="Not enough minutes available")
-    
-    # Verify card ownership
-    card = _maybe(sb.table("cards").select("*").eq("card_id", payload.card_id).maybe_single().execute())
-    if not card:
-        raise HTTPException(status_code=404, detail="Card not found")
-    
-    if card["owner_id"] != user["user_id"]:
-        raise HTTPException(status_code=400, detail="You don't own this card")
-    
-    # Calculate price
-    total_price = payload.minutes_to_buy * listing["price_per_minute_xlm"]
-    
-    # Verify transaction on Stellar
-    try:
-        transaction = STELLAR_SERVER.transactions().transaction(payload.transaction_hash).call()
-        
-        # Get seller's wallet
-        seller = _maybe(sb.table("users").select("stellar_public_key").eq("user_id", listing["seller_id"]).maybe_single().execute())
-        if not seller:
-            raise HTTPException(status_code=400, detail="Seller not found")
-        
-        # Verify payment to seller
-        payment_found = False
-        for operation in transaction.get('operations', []):
-            if operation['type'] == 'payment':
-                if (operation['to'] == seller["stellar_public_key"] and 
-                    operation['from'] == user.get('stellar_public_key') and
-                    float(operation['amount']) >= total_price):
-                    payment_found = True
-                    break
-        
-        if not payment_found:
-            raise HTTPException(status_code=400, detail="Payment not verified")
-        
-        # Extend card time
-        current_expires = _parse_dt(card["expires_at"])
-        new_expires = current_expires + timedelta(minutes=payload.minutes_to_buy)
-        
-        sb.table("cards").update({
-            "expires_at": new_expires.isoformat(),
-            "time_extensions": card.get("time_extensions", 0) + 1,
-            "total_time_purchased": card.get("total_time_purchased", 0) + payload.minutes_to_buy,
-        }).eq("card_id", payload.card_id).execute()
-        
-        # Update listing
-        remaining_minutes = listing["minutes_available"] - payload.minutes_to_buy
-        if remaining_minutes <= 0:
-            sb.table("time_marketplace").update({"is_active": False, "minutes_available": 0}).eq("listing_id", payload.listing_id).execute()
-        else:
-            sb.table("time_marketplace").update({"minutes_available": remaining_minutes}).eq("listing_id", payload.listing_id).execute()
-        
-        # Record purchase
-        sb.table("time_purchases").insert({
-            "purchase_id": f"tp_{uuid.uuid4().hex[:12]}",
-            "buyer_id": user["user_id"],
-            "seller_id": listing["seller_id"],
-            "listing_id": payload.listing_id,
-            "minutes_purchased": payload.minutes_to_buy,
-            "price_xlm": total_price,
-            "transaction_hash": payload.transaction_hash,
-            "status": "complete",
-        }).execute()
-        
-        return {
-            "ok": True,
-            "minutes_added": payload.minutes_to_buy,
-            "new_expires_at": new_expires.isoformat(),
-            "cost_xlm": total_price,
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Payment verification failed: {str(e)}")
+# ========= Referral =========
+@api_router.get("/referral/me")
+def referral_me(user: dict = Depends(get_current_user)):
+    return {
+        "referral_code": user.get("referral_code"),
+        "diamonds": user.get("diamonds", 0),
+        "diamond_boost_cost": DIAMOND_BOOST_COST,
+        "diamond_boost_minutes": DIAMOND_BOOST_MINUTES,
+    }
 
 
-# ========= Cards (Updated) =========
+# ========= Cards =========
 def _card_public(doc: dict) -> dict:
     return {
         "card_id": doc["card_id"],
@@ -445,15 +356,12 @@ def _card_public(doc: dict) -> dict:
 
 @api_router.post("/cards")
 def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
-    """Create a new card - first card is free for all users"""
-    global built_in_cards_replaced
-    
     free_cards_used = _get_free_cards_count(user["user_id"])
     is_free_card = free_cards_used < FREE_CARDS_PER_USER
     
     if not is_free_card:
         if user.get("tokens", 0) < TOKENS_TO_CREATE_CARD:
-            raise HTTPException(status_code=402, detail=f"Not enough tokens. Need {TOKENS_TO_CREATE_CARD} tokens to create a card.")
+            raise HTTPException(status_code=402, detail=f"Not enough tokens. Need {TOKENS_TO_CREATE_CARD} tokens.")
     
     if not payload.smart_link.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="smart_link must be a valid URL")
@@ -488,7 +396,6 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
     }
     sb.table("cards").insert(card).execute()
 
-    # Update free card count
     if is_free_card:
         sb.table("free_cards_used").upsert({
             "user_id": user["user_id"],
@@ -504,9 +411,6 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
 
 @api_router.get("/cards/marketplace")
 def get_marketplace(user: dict = Depends(get_current_user)):
-    """Get marketplace cards with built-in sponsor cards that disappear after 20th card"""
-    global built_in_cards_replaced
-    
     now_iso = datetime.now(timezone.utc).isoformat()
     res = sb.table("cards").select("*").gt("expires_at", now_iso).neq("owner_id", user["user_id"]).limit(500).execute()
     cards = res.data or []
@@ -514,11 +418,9 @@ def get_marketplace(user: dict = Depends(get_current_user)):
     
     marketplace_cards = [_card_public(c) for c in cards[:12]]
     
-    # Count total user-created cards
     total_cards_res = sb.table("cards").select("card_id", count="exact").execute()
     total_user_cards = total_cards_res.count if hasattr(total_cards_res, 'count') else len(total_cards_res.data or [])
     
-    # If marketplace has less than 12 cards and we haven't hit the 20-card limit
     if len(marketplace_cards) < 12 and total_user_cards < BUILT_IN_CARD_LIMIT:
         built_in_needed = 12 - len(marketplace_cards)
         marketplace_cards.extend(_get_built_in_cards(built_in_needed))
@@ -526,8 +428,73 @@ def get_marketplace(user: dict = Depends(get_current_user)):
     return marketplace_cards[:12]
 
 
+@api_router.get("/cards/mine")
+def get_my_cards(user: dict = Depends(get_current_user)):
+    res = sb.table("cards").select("*").eq("owner_id", user["user_id"]).order("created_at", desc=True).limit(500).execute()
+    return [_card_public(c) for c in (res.data or [])]
+
+
+@api_router.post("/cards/{card_id}/vote")
+def vote_card(card_id: str, user: dict = Depends(get_current_user)):
+    card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+    if card["owner_id"] == user["user_id"]:
+        raise HTTPException(status_code=400, detail="Cannot vote on your own card")
+
+    expires_dt = _parse_dt(card["expires_at"])
+    if expires_dt < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Card has expired")
+
+    sb.table("votes").insert({
+        "vote_id": f"vote_{uuid.uuid4().hex[:12]}",
+        "voter_id": user["user_id"],
+        "card_id": card_id,
+        "owner_id": card["owner_id"],
+        "vote_type": "ads",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+    sb.table("cards").update({"votes": card.get("votes", 0) + 1}).eq("card_id", card_id).execute()
+
+    new_progress = user.get("votes_since_token", 0) + 1
+    tokens_earned = 0
+    if new_progress >= VOTES_PER_TOKEN:
+        tokens_earned = new_progress // VOTES_PER_TOKEN
+        new_progress = new_progress % VOTES_PER_TOKEN
+    new_tokens = user.get("tokens", 0) + tokens_earned
+    sb.table("users").update({"votes_since_token": new_progress, "tokens": new_tokens}).eq("user_id", user["user_id"]).execute()
+
+    return {
+        "ok": True,
+        "smart_link": card["smart_link"],
+        "tokens": new_tokens,
+        "votes_since_token": new_progress,
+        "tokens_earned": tokens_earned,
+    }
+
+
+# ========= Image Library =========
+SYSTEM_IMAGES = [
+    "https://images.unsplash.com/photo-1723283126758-28f2a308bc47?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
+    "https://images.unsplash.com/photo-1689154345830-861f74006b09?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
+    "https://images.pexels.com/photos/29888428/pexels-photo-29888428.jpeg?auto=compress&cs=tinysrgb&w=800",
+    "https://images.pexels.com/photos/25626583/pexels-photo-25626583.jpeg?auto=compress&cs=tinysrgb&w=800",
+    "https://images.unsplash.com/photo-1639817754460-9af351966008?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
+    "https://images.unsplash.com/photo-1557672172-298e090bd0f1?auto=format&fit=crop&w=800&q=80",
+    "https://images.unsplash.com/photo-1558865869-c93f6f8482af?auto=format&fit=crop&w=800&q=80",
+    "https://images.unsplash.com/photo-1579547945413-497e1b99dac0?auto=format&fit=crop&w=800&q=80",
+    "https://images.unsplash.com/photo-1618331835717-801e976710b2?auto=format&fit=crop&w=800&q=80",
+    "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?auto=format&fit=crop&w=800&q=80",
+    "https://images.unsplash.com/photo-1604871000636-074fa5117945?auto=format&fit=crop&w=800&q=80",
+    "https://images.unsplash.com/photo-1614850523459-c2f4c699c52e?auto=format&fit=crop&w=800&q=80",
+]
+
+@api_router.get("/images/library")
+def image_library(user: dict = Depends(get_current_user)):
+    return {"images": SYSTEM_IMAGES}
+
+
 def _get_built_in_cards(count: int) -> list:
-    """Get built-in sponsor cards"""
     sponsor_cards = [
         {
             "card_id": f"sponsor_{uuid.uuid4().hex[:8]}",
@@ -555,7 +522,6 @@ def _get_built_in_cards(count: int) -> list:
 
 @api_router.get("/stellar/status")
 def stellar_status(user: dict = Depends(get_current_user)):
-    """Get Stellar network status and user wallet info"""
     xlm_balance = 0.0
     if user.get("stellar_public_key"):
         xlm_balance = _check_stellar_balance(user["stellar_public_key"])
@@ -576,7 +542,6 @@ def stellar_status(user: dict = Depends(get_current_user)):
 
 @api_router.post("/stellar/upgrade")
 def stellar_upgrade(payload: StellarUpgradePayload, user: dict = Depends(get_current_user)):
-    """Upgrade to Stellar membership by paying 20 XLM"""
     if user.get("has_paid_upgrade"):
         raise HTTPException(status_code=400, detail="Already upgraded")
     
@@ -615,21 +580,18 @@ def stellar_upgrade(payload: StellarUpgradePayload, user: dict = Depends(get_cur
             "membership_type": "crypto",
             "message": "Successfully upgraded to Stellar membership"
         }
-        
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Payment verification failed: {str(e)}")
 
 
 @api_router.post("/stellar/vote/{card_id}")
 def stellar_vote(card_id: str, payload: StellarVotePayload, user: dict = Depends(get_current_user)):
-    """Vote on a card using XLM"""
     if user.get("membership_type") != "crypto":
         raise HTTPException(status_code=400, detail="Must be a crypto member to vote with XLM")
     
     card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
-    
     if card["owner_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot vote on your own card")
     
@@ -679,19 +641,191 @@ def stellar_vote(card_id: str, payload: StellarVotePayload, user: dict = Depends
             }
         else:
             raise HTTPException(status_code=400, detail="Card owner has no Stellar wallet")
-            
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Payment verification failed: {str(e)}")
 
 
-# ========= Remaining routes (cards/mine, vote, images, payfast) =========
-# [Keep the existing routes for /cards/mine, /cards/{card_id}/vote (ads vote),
-#  /images/library, and PayFast routes as they were]
+# ========= Time Marketplace =========
 
-@api_router.get("/cards/mine")
-def get_my_cards(user: dict = Depends(get_current_user)):
-    res = sb.table("cards").select("*").eq("owner_id", user["user_id"]).order("created_at", desc=True).limit(500).execute()
-    return [_card_public(c) for c in (res.data or [])]
+@api_router.post("/marketplace/time/list")
+def create_time_listing(payload: TimeListingCreate, user: dict = Depends(get_current_user)):
+    if user.get("membership_type") != "crypto":
+        raise HTTPException(status_code=400, detail="Must be a crypto member to sell time")
+    
+    if payload.minutes_available < TIME_PURCHASE_MIN_MINUTES:
+        raise HTTPException(status_code=400, detail=f"Minimum {TIME_PURCHASE_MIN_MINUTES} minutes required")
+    
+    if payload.price_per_minute_xlm <= 0:
+        raise HTTPException(status_code=400, detail="Price must be greater than 0")
+    
+    total_price = payload.minutes_available * payload.price_per_minute_xlm
+    
+    listing = {
+        "listing_id": f"tlist_{uuid.uuid4().hex[:12]}",
+        "seller_id": user["user_id"],
+        "minutes_available": payload.minutes_available,
+        "price_per_minute_xlm": payload.price_per_minute_xlm,
+        "total_price_xlm": total_price,
+        "is_active": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    sb.table("time_marketplace").insert(listing).execute()
+    
+    return {"ok": True, "listing": listing}
+
+
+@api_router.get("/marketplace/time/listings")
+def get_time_listings(user: dict = Depends(get_current_user)):
+    res = sb.table("time_marketplace").select("*").eq("is_active", True).neq("seller_id", user["user_id"]).execute()
+    listings = res.data or []
+    
+    enriched = []
+    for listing in listings:
+        seller = _maybe(sb.table("users").select("name,stellar_public_key").eq("user_id", listing["seller_id"]).maybe_single().execute())
+        listing["seller_name"] = seller.get("name", "Unknown") if seller else "Unknown"
+        listing["seller_wallet"] = seller.get("stellar_public_key") if seller else None
+        enriched.append(listing)
+    
+    return {"listings": enriched}
+
+
+@api_router.post("/marketplace/time/buy")
+def buy_time(payload: TimePurchasePayload, user: dict = Depends(get_current_user)):
+    if user.get("membership_type") != "crypto":
+        raise HTTPException(status_code=400, detail="Must be a crypto member to buy time")
+    
+    listing = _maybe(sb.table("time_marketplace").select("*").eq("listing_id", payload.listing_id).maybe_single().execute())
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if not listing["is_active"]:
+        raise HTTPException(status_code=400, detail="Listing is no longer active")
+    if payload.minutes_to_buy > listing["minutes_available"]:
+        raise HTTPException(status_code=400, detail="Not enough minutes available")
+    
+    card = _maybe(sb.table("cards").select("*").eq("card_id", payload.card_id).maybe_single().execute())
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+    if card["owner_id"] != user["user_id"]:
+        raise HTTPException(status_code=400, detail="You don't own this card")
+    
+    total_price = payload.minutes_to_buy * listing["price_per_minute_xlm"]
+    
+    try:
+        transaction = STELLAR_SERVER.transactions().transaction(payload.transaction_hash).call()
+        
+        seller = _maybe(sb.table("users").select("stellar_public_key").eq("user_id", listing["seller_id"]).maybe_single().execute())
+        if not seller:
+            raise HTTPException(status_code=400, detail="Seller not found")
+        
+        payment_found = False
+        for operation in transaction.get('operations', []):
+            if operation['type'] == 'payment':
+                if (operation['to'] == seller["stellar_public_key"] and 
+                    operation['from'] == user.get('stellar_public_key') and
+                    float(operation['amount']) >= total_price):
+                    payment_found = True
+                    break
+        
+        if not payment_found:
+            raise HTTPException(status_code=400, detail="Payment not verified")
+        
+        current_expires = _parse_dt(card["expires_at"])
+        new_expires = current_expires + timedelta(minutes=payload.minutes_to_buy)
+        
+        sb.table("cards").update({
+            "expires_at": new_expires.isoformat(),
+            "time_extensions": card.get("time_extensions", 0) + 1,
+            "total_time_purchased": card.get("total_time_purchased", 0) + payload.minutes_to_buy,
+        }).eq("card_id", payload.card_id).execute()
+        
+        remaining_minutes = listing["minutes_available"] - payload.minutes_to_buy
+        if remaining_minutes <= 0:
+            sb.table("time_marketplace").update({"is_active": False, "minutes_available": 0}).eq("listing_id", payload.listing_id).execute()
+        else:
+            sb.table("time_marketplace").update({"minutes_available": remaining_minutes}).eq("listing_id", payload.listing_id).execute()
+        
+        sb.table("time_purchases").insert({
+            "purchase_id": f"tp_{uuid.uuid4().hex[:12]}",
+            "buyer_id": user["user_id"],
+            "seller_id": listing["seller_id"],
+            "listing_id": payload.listing_id,
+            "minutes_purchased": payload.minutes_to_buy,
+            "price_xlm": total_price,
+            "transaction_hash": payload.transaction_hash,
+            "status": "complete",
+        }).execute()
+        
+        return {
+            "ok": True,
+            "minutes_added": payload.minutes_to_buy,
+            "new_expires_at": new_expires.isoformat(),
+            "cost_xlm": total_price,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Payment verification failed: {str(e)}")
+
+
+# ========= PayFast =========
+def _payfast_signature(params: dict, passphrase: str = "") -> str:
+    filtered = {k: v for k, v in params.items() if v not in (None, "")}
+    pairs = []
+    for k in sorted(filtered.keys()):
+        v = str(filtered[k]).strip()
+        pairs.append(f"{k}={quote(v, safe='')}")
+    query = "&".join(pairs)
+    if passphrase:
+        query += f"&passphrase={quote(passphrase, safe='')}"
+    return hashlib.md5(query.encode("utf-8")).hexdigest()
+
+
+@api_router.post("/payments/payfast/initiate")
+def payfast_initiate(payload: PayfastInitiatePayload, user: dict = Depends(get_current_user)):
+    merchant_id = os.environ.get("PAYFAST_MERCHANT_ID", "")
+    merchant_key = os.environ.get("PAYFAST_MERCHANT_KEY", "")
+    passphrase = os.environ.get("PAYFAST_PASSPHRASE", "")
+    sandbox = os.environ.get("PAYFAST_SANDBOX", "true").lower() == "true"
+
+    m_payment_id = f"stokvel_{user['user_id']}_{uuid.uuid4().hex[:8]}"
+    params = {
+        "merchant_id": merchant_id,
+        "merchant_key": merchant_key,
+        "return_url": payload.return_url,
+        "cancel_url": payload.cancel_url,
+        "m_payment_id": m_payment_id,
+        "amount": "5.00",
+        "item_name": "Stokvel Premium (Monthly)",
+        "email_address": user["email"],
+        "subscription_type": "1",
+        "billing_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "recurring_amount": "5.00",
+        "frequency": "3",
+        "cycles": "0",
+    }
+    signature = _payfast_signature(params, passphrase)
+    params["signature"] = signature
+
+    sb.table("subscriptions").insert({
+        "m_payment_id": m_payment_id,
+        "user_id": user["user_id"],
+        "kind": "subscription",
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    base = "https://sandbox.payfast.co.za/eng/process" if sandbox else "https://www.payfast.co.za/eng/process"
+    query = "&".join([f"{k}={quote(str(v), safe='')}" for k, v in params.items()])
+    return {"redirect_url": f"{base}?{query}", "m_payment_id": m_payment_id}
+
+
+@api_router.post("/payments/payfast/activate-sandbox")
+def payfast_activate_sandbox(user: dict = Depends(get_current_user)):
+    sandbox = os.environ.get("PAYFAST_SANDBOX", "true").lower() == "true"
+    if not sandbox:
+        raise HTTPException(status_code=400, detail="Only available in sandbox mode")
+    premium_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    sb.table("users").update({"is_premium": True, "premium_until": premium_until}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "is_premium": True, "premium_until": premium_until}
 
 
 # ========= App wiring =========
@@ -715,6 +849,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+def backfill_user_fields():
+    try:
+        res = sb.table("users").select("user_id").is_("referral_code", "null").execute()
+        for u in (res.data or []):
+            sb.table("users").update({"referral_code": uuid.uuid4().hex[:8]}).eq("user_id", u["user_id"]).execute()
+    except Exception as e:
+        logger.warning("Backfill skipped: %s", e)
 
 
 if __name__ == "__main__":
