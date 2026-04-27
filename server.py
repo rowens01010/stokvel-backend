@@ -18,13 +18,12 @@ from stellar_sdk import Server, Keypair, TransactionBuilder, Network, Asset
 from stellar_sdk.exceptions import NotFoundError
 import asyncio
 
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 SUPABASE_URL = os.environ['SUPABASE_URL']
 SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
 
 # Stellar configuration
 STELLAR_NETWORK = os.environ.get("STELLAR_NETWORK", "TESTNET")
@@ -39,13 +38,15 @@ STOKVEL_TREASURY_PUBLIC = os.environ.get("STOKVEL_TREASURY_PUBLIC", "")
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
+# ========= Constants =========
 FREE_CARD_TTL_MINUTES = 20
 PREMIUM_CARD_TTL_MINUTES = 35
 VOTES_PER_TOKEN = 10
-INITIAL_TOKENS = 3
+INITIAL_AD_TOKENS = 3
 DIAMOND_BOOST_COST = 5
 DIAMOND_BOOST_MINUTES = 10
 
+<<<<<<< Updated upstream
 # Stellar constants
 UPGRADE_COST_XLM = 20.0
 VOTE_COST_XLM = 0.07
@@ -64,6 +65,12 @@ TIME_PACKS = {
 # Track built-in cards replaced
 built_in_cards_replaced = 0
 
+=======
+# Crypto/Upgrade Constants
+UPGRADE_COST_SOL = 0.012  # One-time upgrade fee
+MONTHLY_SERVICE_FEE_SOL = 0.01  # Monthly service fee
+DEFAULT_VOTE_COST_SOL = 0.001  # Cost per crypto vote
+>>>>>>> Stashed changes
 
 # ========= Helpers =========
 def _parse_dt(value):
@@ -78,12 +85,61 @@ def _parse_dt(value):
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
-
 def _maybe(res):
     if res is None:
         return None
+    if hasattr(res, 'error') and res.error:
+        logger.error(f"Supabase error: {res.error}")
+        return None
     return getattr(res, "data", None)
 
+def _get_ad_tokens(user: dict) -> int:
+    """Get ad_tokens with backward compatibility for old 'tokens' field"""
+    ad_tokens = user.get("ad_tokens")
+    if ad_tokens is None:
+        # Fall back to old 'tokens' field
+        ad_tokens = user.get("tokens", 0)
+    return int(ad_tokens) if ad_tokens is not None else 0
+
+def _get_sol_balance(user: dict) -> float:
+    """Get sol_balance with fallback"""
+    balance = user.get("sol_balance")
+    return float(balance) if balance is not None else 0.0
+
+def _get_wallet_address(user: dict) -> Optional[str]:
+    """Get wallet_address with fallback to stellar_public_key"""
+    wallet = user.get("wallet_address")
+    if not wallet:
+        wallet = user.get("stellar_public_key")
+    return wallet
+
+def _get_is_upgraded(user: dict) -> bool:
+    """Get is_upgraded with fallback to has_paid_upgrade"""
+    upgraded = user.get("is_upgraded")
+    if upgraded is None:
+        upgraded = user.get("has_paid_upgrade", False)
+    return bool(upgraded)
+
+def _get_card_type(card: dict) -> str:
+    """Get card_type with fallback for old cards"""
+    card_type = card.get("card_type")
+    if not card_type:
+        card_type = "smartlink"  # Default for old cards
+    return card_type
+
+def _get_owner_wallet(card: dict) -> Optional[str]:
+    """Get owner_wallet with fallback to owner_stellar_wallet"""
+    wallet = card.get("owner_wallet")
+    if not wallet:
+        wallet = card.get("owner_stellar_wallet")
+    return wallet
+
+def _get_vote_cost_sol(card: dict) -> float:
+    """Get vote_cost_sol with fallback"""
+    cost = card.get("vote_cost_sol")
+    if cost is None:
+        cost = DEFAULT_VOTE_COST_SOL
+    return float(cost)
 
 def _check_stellar_balance(public_key: str) -> float:
     try:
@@ -120,13 +176,26 @@ class CardCreate(BaseModel):
     smart_link: str
     title: Optional[str] = ""
     use_diamond_boost: Optional[bool] = False
+<<<<<<< Updated upstream
     extra_minutes: Optional[int] = 0  # Minutes from user's time bank
+=======
+    card_type: Optional[str] = "smartlink"  # "smartlink" or "crypto"
+    vote_cost_sol: Optional[float] = DEFAULT_VOTE_COST_SOL
+>>>>>>> Stashed changes
 
+class ConnectWalletRequest(BaseModel):
+    wallet_address: str
 
-class PayfastInitiatePayload(BaseModel):
-    return_url: str
-    cancel_url: str
+class UpgradeRequest(BaseModel):
+    tx_hash: str  # 0.012 SOL upgrade payment
 
+class ServiceFeeRequest(BaseModel):
+    tx_hash: str  # 0.01 SOL monthly service fee
+
+class CryptoVoteRequest(BaseModel):
+    card_id: str
+    tx_hash: str  # SOL vote payment transaction hash
+    amount_sol: float  # Amount sent in SOL
 
 class GoogleAuthPayload(BaseModel):
     id_token: str
@@ -135,6 +204,7 @@ class GoogleAuthPayload(BaseModel):
     picture: str
     ref: Optional[str] = None
 
+<<<<<<< Updated upstream
 
 class StellarUpgradePayload(BaseModel):
     transaction_hash: str
@@ -149,6 +219,8 @@ class TimePackPurchase(BaseModel):
     transaction_hash: str
 
 
+=======
+>>>>>>> Stashed changes
 # ========= Auth =========
 def get_current_user(
     request: Request,
@@ -174,19 +246,20 @@ def get_current_user(
     user = _maybe(user_res)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    
+    # Check service fee status for upgraded users
+    check_service_fee(user)
+    
     return user
-
 
 # ========= Root Routes =========
 @app.get("/")
 def root():
     return {"message": "Stokvel API is running"}
 
-
 @api_router.get("/")
 def api_root():
     return {"message": "Stokvel API"}
-
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
@@ -205,6 +278,7 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
         updates = {"name": name, "picture": picture}
         if not existing.get("referral_code"):
             updates["referral_code"] = uuid.uuid4().hex[:8]
+<<<<<<< Updated upstream
         if existing.get("diamonds") is None:
             updates["diamonds"] = 0
         if existing.get("membership_type") is None:
@@ -215,6 +289,19 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
             updates["available_minutes"] = 0
         if existing.get("total_minutes_purchased") is None:
             updates["total_minutes_purchased"] = 0
+=======
+        
+        # Ensure new columns exist for existing users
+        if existing.get("ad_tokens") is None and existing.get("tokens") is not None:
+            updates["ad_tokens"] = existing["tokens"]
+        if existing.get("sol_balance") is None:
+            updates["sol_balance"] = 0.0
+        if existing.get("is_upgraded") is None:
+            updates["is_upgraded"] = existing.get("has_paid_upgrade", False)
+        if existing.get("service_fee_paid") is None:
+            updates["service_fee_paid"] = existing.get("has_paid_upgrade", False)
+        
+>>>>>>> Stashed changes
         sb.table("users").update(updates).eq("user_id", user_id).execute()
     else:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -228,26 +315,42 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
                     {"diamonds": (ref_user.get("diamonds") or 0) + 1}
                 ).eq("user_id", ref_user["user_id"]).execute()
         
+<<<<<<< Updated upstream
         stellar_keypair = _create_stellar_keypair()
         
+=======
+        # Insert with both old and new columns for compatibility
+>>>>>>> Stashed changes
         sb.table("users").insert({
             "user_id": user_id,
             "email": email,
             "name": name,
             "picture": picture,
-            "tokens": INITIAL_TOKENS,
-            "diamonds": 0,
+            "tokens": INITIAL_AD_TOKENS,  # Old field
+            "ad_tokens": INITIAL_AD_TOKENS,  # New field
+            "sol_balance": 0.0,
+            "is_upgraded": False,
             "is_premium": False,
+            "wallet_address": None,
+            "diamonds": 0,
             "premium_until": None,
+            "upgrade_date": None,
+            "last_service_fee_date": None,
             "votes_since_token": 0,
             "referral_code": referral_code,
             "referred_by": referred_by,
+<<<<<<< Updated upstream
             "membership_type": "free",
             "has_paid_upgrade": False,
             "stellar_public_key": stellar_keypair["public_key"],
             "stellar_seed": stellar_keypair["secret"],
             "available_minutes": 0,
             "total_minutes_purchased": 0,
+=======
+            "service_fee_paid": False,
+            "membership_type": "free",
+            "has_paid_upgrade": False,
+>>>>>>> Stashed changes
             "created_at": now_iso,
         }).execute()
         
@@ -275,9 +378,9 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
     )
     return {"ok": True, "user_id": user_id, "token": session_token}
 
-
 @api_router.get("/auth/me")
 def auth_me(user: dict = Depends(get_current_user)):
+<<<<<<< Updated upstream
     if user.get("is_premium") and user.get("premium_until"):
         pu = _parse_dt(user["premium_until"])
         if pu and pu < datetime.now(timezone.utc):
@@ -287,29 +390,52 @@ def auth_me(user: dict = Depends(get_current_user)):
     xlm_balance = 0.0
     if user.get("stellar_public_key"):
         xlm_balance = _check_stellar_balance(user["stellar_public_key"])
+=======
+    # Check service fee
+    check_service_fee(user)
+    
+    ad_tokens = _get_ad_tokens(user)
+    sol_balance = _get_sol_balance(user)
+    wallet_address = _get_wallet_address(user)
+    is_upgraded = _get_is_upgraded(user)
+>>>>>>> Stashed changes
     
     return {
         "user_id": user["user_id"],
         "email": user["email"],
         "name": user["name"],
         "picture": user.get("picture", ""),
-        "tokens": user.get("tokens", 0),
-        "diamonds": user.get("diamonds", 0),
+        "ad_tokens": ad_tokens,
+        "tokens": user.get("tokens", ad_tokens),  # Backward compat
+        "sol_balance": sol_balance,
+        "is_upgraded": is_upgraded,
         "is_premium": user.get("is_premium", False),
+        "wallet_address": wallet_address,
+        "diamonds": user.get("diamonds", 0),
         "premium_until": user.get("premium_until"),
         "votes_since_token": user.get("votes_since_token", 0),
         "votes_per_token": VOTES_PER_TOKEN,
         "referral_code": user.get("referral_code"),
         "diamond_boost_cost": DIAMOND_BOOST_COST,
         "diamond_boost_minutes": DIAMOND_BOOST_MINUTES,
+<<<<<<< Updated upstream
         "membership_type": user.get("membership_type", "free"),
         "has_paid_upgrade": user.get("has_paid_upgrade", False),
         "stellar_public_key": user.get("stellar_public_key"),
         "xlm_balance": xlm_balance,
         "available_minutes": user.get("available_minutes", 0),
         "total_minutes_purchased": user.get("total_minutes_purchased", 0),
+=======
+        "upgrade_cost_sol": UPGRADE_COST_SOL,
+        "monthly_service_fee_sol": MONTHLY_SERVICE_FEE_SOL,
+        "vote_cost_sol": DEFAULT_VOTE_COST_SOL,
+        "service_fee_paid": user.get("service_fee_paid", False),
+        "upgrade_date": user.get("upgrade_date"),
+        "last_service_fee_date": user.get("last_service_fee_date"),
+        "has_paid_upgrade": user.get("has_paid_upgrade", False),  # Backward compat
+        "membership_type": user.get("membership_type", "free"),
+>>>>>>> Stashed changes
     }
-
 
 @api_router.post("/auth/logout")
 def auth_logout(
@@ -325,6 +451,145 @@ def auth_logout(
     response.delete_cookie(key="session_token", path="/", samesite="lax", secure=False)
     return {"ok": True}
 
+# ========= Service Fee Check =========
+def check_service_fee(user: dict):
+    """Check if user needs to pay monthly service fee"""
+    is_upgraded = _get_is_upgraded(user)
+    if not is_upgraded:
+        return
+    
+    last_fee = user.get("last_service_fee_date")
+    if last_fee:
+        last_fee_dt = _parse_dt(last_fee)
+        next_fee_due = last_fee_dt + timedelta(days=30)
+        if datetime.now(timezone.utc) > next_fee_due:
+            # Past due - mark as needing payment
+            try:
+                sb.table("users").update({
+                    "service_fee_paid": False
+                }).eq("user_id", user["user_id"]).execute()
+                user["service_fee_paid"] = False
+            except Exception as e:
+                logger.error(f"Service fee check failed: {e}")
+    else:
+        # No fee date set, but is upgraded - set it now
+        now = datetime.now(timezone.utc)
+        try:
+            sb.table("users").update({
+                "last_service_fee_date": now.isoformat(),
+                "service_fee_paid": True
+            }).eq("user_id", user["user_id"]).execute()
+            user["last_service_fee_date"] = now.isoformat()
+            user["service_fee_paid"] = True
+        except Exception as e:
+            logger.error(f"Setting initial service fee date failed: {e}")
+
+# ========= Wallet & Upgrade =========
+@api_router.post("/wallet/connect")
+def connect_wallet(payload: ConnectWalletRequest, user: dict = Depends(get_current_user)):
+    """Connect Phantom wallet - required before upgrade"""
+    sb.table("users").update({
+        "wallet_address": payload.wallet_address
+    }).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "wallet_address": payload.wallet_address}
+
+@api_router.post("/upgrade/verify")
+def verify_upgrade(payload: UpgradeRequest, user: dict = Depends(get_current_user)):
+    """Verify upgrade payment (0.012 SOL)"""
+    
+    wallet_address = _get_wallet_address(user)
+    if not wallet_address:
+        raise HTTPException(status_code=400, detail="Connect wallet first")
+    
+    # Check tx_hash not used
+    existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
+    if existing:
+        raise HTTPException(status_code=400, detail="Transaction already used")
+    
+    # Record upgrade transaction
+    now = datetime.now(timezone.utc)
+    tx_data = {
+        "tx_id": f"up_{uuid.uuid4().hex[:12]}",
+        "from_user_id": user["user_id"],
+        "to_user_id": None,  # Platform fee
+        "tx_type": "upgrade",
+        "amount_sol": UPGRADE_COST_SOL,
+        "tx_hash": payload.tx_hash,
+        "status": "confirmed",
+        "confirmed_at": now.isoformat()
+    }
+    
+    try:
+        sb.table("sol_transactions").insert(tx_data).execute()
+    except Exception as e:
+        logger.error(f"Failed to insert sol_transaction: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record transaction")
+    
+    # Upgrade user - update both old and new fields
+    update_data = {
+        "is_upgraded": True,
+        "has_paid_upgrade": True,  # Backward compat
+        "upgrade_date": now.isoformat(),
+        "last_service_fee_date": now.isoformat(),
+        "service_fee_paid": True,
+        "sol_balance": 0.0
+    }
+    
+    try:
+        sb.table("users").update(update_data).eq("user_id", user["user_id"]).execute()
+    except Exception as e:
+        logger.error(f"Failed to update user after upgrade: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update user")
+    
+    return {"ok": True, "is_upgraded": True}
+
+@api_router.post("/service-fee/verify")
+def verify_service_fee(payload: ServiceFeeRequest, user: dict = Depends(get_current_user)):
+    """Verify monthly service fee (0.01 SOL)"""
+    
+    is_upgraded = _get_is_upgraded(user)
+    if not is_upgraded:
+        raise HTTPException(status_code=400, detail="Not an upgraded user")
+    
+    # Check tx_hash not used
+    existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
+    if existing:
+        raise HTTPException(status_code=400, detail="Transaction already used")
+    
+    # Record fee
+    now = datetime.now(timezone.utc)
+    tx_data = {
+        "tx_id": f"fee_{uuid.uuid4().hex[:12]}",
+        "from_user_id": user["user_id"],
+        "to_user_id": None,  # Platform fee
+        "tx_type": "service_fee",
+        "amount_sol": MONTHLY_SERVICE_FEE_SOL,
+        "tx_hash": payload.tx_hash,
+        "status": "confirmed",
+        "confirmed_at": now.isoformat()
+    }
+    
+    try:
+        sb.table("sol_transactions").insert(tx_data).execute()
+    except Exception as e:
+        logger.error(f"Failed to insert service fee transaction: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record transaction")
+    
+    # Update last fee date and mark as paid
+    try:
+        sb.table("users").update({
+            "last_service_fee_date": now.isoformat(),
+            "service_fee_paid": True
+        }).eq("user_id", user["user_id"]).execute()
+    except Exception as e:
+        logger.error(f"Failed to update service fee: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update service fee")
+    
+    return {
+        "ok": True, 
+        "next_fee_due": (now + timedelta(days=30)).isoformat(),
+        "service_fee_paid": True
+    }
 
 # ========= Referral =========
 @api_router.get("/referral/me")
@@ -351,6 +616,7 @@ def _card_public(doc: dict) -> dict:
         "expires_at": doc["expires_at"],
         "is_premium": doc.get("is_premium", False),
         "diamond_boosted": doc.get("diamond_boosted", False),
+<<<<<<< Updated upstream
         "owner_stellar_wallet": doc.get("owner_stellar_wallet"),
         "vote_cost_xlm": doc.get("vote_cost_xlm", 0.07),
         "extra_minutes_added": doc.get("extra_minutes_added", 0),
@@ -366,12 +632,43 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
     if not is_free_card:
         if user.get("tokens", 0) < TOKENS_TO_CREATE_CARD:
             raise HTTPException(status_code=402, detail=f"Not enough tokens. Need {TOKENS_TO_CREATE_CARD} tokens.")
+=======
+        "card_type": _get_card_type(doc),
+        "vote_cost_sol": _get_vote_cost_sol(doc),
+        "owner_wallet": _get_owner_wallet(doc),
+    }
+
+@api_router.post("/cards")
+def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
+    """Create a card (smartlink or crypto)"""
+    
+    card_type = payload.card_type
+    ad_tokens = _get_ad_tokens(user)
+    wallet_address = _get_wallet_address(user)
+    is_upgraded = _get_is_upgraded(user)
+    
+    if card_type == "crypto":
+        if not is_upgraded:
+            raise HTTPException(status_code=402, detail="Upgrade required for crypto cards")
+        if not wallet_address:
+            raise HTTPException(status_code=400, detail="Connect wallet first")
+        if not user.get("service_fee_paid"):
+            raise HTTPException(status_code=402, detail="Service fee payment required")
+        # Crypto cards are free to create (no token cost)
+        token_cost = 0
+    else:
+        # SmartLink cards cost 1 ad_token
+        if ad_tokens < 1:
+            raise HTTPException(status_code=402, detail="Not enough ad tokens")
+        token_cost = 1
+>>>>>>> Stashed changes
     
     if not payload.smart_link.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="smart_link must be a valid URL")
     if not payload.image_url:
         raise HTTPException(status_code=400, detail="image_url is required")
 
+<<<<<<< Updated upstream
     # Validate extra minutes against user's available balance
     extra_minutes = payload.extra_minutes or 0
     if extra_minutes > 0:
@@ -389,6 +686,11 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
     
     now = datetime.now(timezone.utc)
     expires = now + timedelta(minutes=total_ttl)
+=======
+    base_ttl = PREMIUM_CARD_TTL_MINUTES if user.get("is_premium") else FREE_CARD_TTL_MINUTES
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=base_ttl)
+>>>>>>> Stashed changes
     
     card = {
         "card_id": f"card_{uuid.uuid4().hex[:12]}",
@@ -401,14 +703,30 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
         "created_at": now.isoformat(),
         "expires_at": expires.isoformat(),
         "is_premium": bool(user.get("is_premium", False)),
+<<<<<<< Updated upstream
         "diamond_boosted": use_boost,
         "owner_stellar_wallet": user.get("stellar_public_key"),
         "vote_cost_xlm": VOTE_COST_XLM,
         "extra_minutes_added": extra_minutes,
         "total_lifespan_minutes": total_ttl,
+=======
+        "diamond_boosted": False,
+        "card_type": card_type,
+        "vote_cost_sol": payload.vote_cost_sol if card_type == "crypto" else 0.0,
+        "owner_wallet": wallet_address if card_type == "crypto" else None,
+        # Keep backward compat fields
+        "owner_stellar_wallet": wallet_address if card_type == "crypto" else None,
+        "total_lifespan_minutes": base_ttl,
+>>>>>>> Stashed changes
     }
-    sb.table("cards").insert(card).execute()
+    
+    try:
+        sb.table("cards").insert(card).execute()
+    except Exception as e:
+        logger.error(f"Failed to create card: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create card")
 
+<<<<<<< Updated upstream
     # Deduct from user
     if is_free_card:
         sb.table("free_cards_used").upsert({
@@ -428,14 +746,37 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
     if extra_minutes > 0:
         new_available = user.get("available_minutes", 0) - extra_minutes
         sb.table("users").update({"available_minutes": new_available}).eq("user_id", user["user_id"]).execute()
+=======
+    # Deduct token if SmartLink
+    if token_cost > 0:
+        new_ad_tokens = ad_tokens - 1
+        update_data = {
+            "ad_tokens": new_ad_tokens,
+            "tokens": new_ad_tokens  # Keep old field in sync
+        }
+        try:
+            sb.table("users").update(update_data).eq("user_id", user["user_id"]).execute()
+            user["ad_tokens"] = new_ad_tokens
+            user["tokens"] = new_ad_tokens
+        except Exception as e:
+            logger.error(f"Failed to deduct tokens: {e}")
+>>>>>>> Stashed changes
     
     return _card_public(card)
 
-
 @api_router.get("/cards/marketplace")
 def get_marketplace(user: dict = Depends(get_current_user)):
+    """Get marketplace - free users see only smartlink cards, upgraded see all"""
     now_iso = datetime.now(timezone.utc).isoformat()
-    res = sb.table("cards").select("*").gt("expires_at", now_iso).neq("owner_id", user["user_id"]).limit(500).execute()
+    is_upgraded = _get_is_upgraded(user)
+    
+    query = sb.table("cards").select("*").gt("expires_at", now_iso).neq("owner_id", user["user_id"])
+    
+    if not is_upgraded:
+        # Free users only see SmartLink cards (card_type = 'smartlink' OR card_type IS NULL)
+        query = query.or_("card_type.eq.smartlink,card_type.is.null")
+    
+    res = query.limit(500).execute()
     cards = res.data or []
     random.shuffle(cards)
     
@@ -450,25 +791,25 @@ def get_marketplace(user: dict = Depends(get_current_user)):
     
     return marketplace_cards[:12]
 
-
 @api_router.get("/cards/mine")
 def get_my_cards(user: dict = Depends(get_current_user)):
     res = sb.table("cards").select("*").eq("owner_id", user["user_id"]).order("created_at", desc=True).limit(500).execute()
     return [_card_public(c) for c in (res.data or [])]
 
-
 @api_router.post("/cards/{card_id}/vote")
 def vote_card(card_id: str, user: dict = Depends(get_current_user)):
+    """Vote on a SmartLink card (free vote)"""
     card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
     if card["owner_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot vote on your own card")
-
+    
     expires_dt = _parse_dt(card["expires_at"])
     if expires_dt < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Card has expired")
 
+<<<<<<< Updated upstream
     sb.table("votes").insert({
         "vote_id": f"vote_{uuid.uuid4().hex[:12]}",
         "voter_id": user["user_id"],
@@ -478,23 +819,134 @@ def vote_card(card_id: str, user: dict = Depends(get_current_user)):
         "created_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
     sb.table("cards").update({"votes": card.get("votes", 0) + 1}).eq("card_id", card_id).execute()
+=======
+    # Only free vote on SmartLink cards (not crypto)
+    card_type = _get_card_type(card)
+    if card_type == "crypto":
+        raise HTTPException(status_code=400, detail="Use crypto-vote for crypto cards")
+
+    try:
+        sb.table("votes").insert({
+            "vote_id": f"vote_{uuid.uuid4().hex[:12]}",
+            "voter_id": user["user_id"],
+            "card_id": card_id,
+            "owner_id": card["owner_id"],
+            "vote_type": "ads",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        sb.table("cards").update({"votes": card.get("votes", 0) + 1}).eq("card_id", card_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to record vote: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record vote")
+>>>>>>> Stashed changes
 
     new_progress = user.get("votes_since_token", 0) + 1
     tokens_earned = 0
     if new_progress >= VOTES_PER_TOKEN:
         tokens_earned = new_progress // VOTES_PER_TOKEN
         new_progress = new_progress % VOTES_PER_TOKEN
-    new_tokens = user.get("tokens", 0) + tokens_earned
-    sb.table("users").update({"votes_since_token": new_progress, "tokens": new_tokens}).eq("user_id", user["user_id"]).execute()
+    
+    ad_tokens = _get_ad_tokens(user)
+    new_tokens = ad_tokens + tokens_earned
+    
+    # Update both old and new token fields
+    try:
+        sb.table("users").update({
+            "votes_since_token": new_progress,
+            "ad_tokens": new_tokens,
+            "tokens": new_tokens  # Keep old field in sync
+        }).eq("user_id", user["user_id"]).execute()
+    except Exception as e:
+        logger.error(f"Failed to update tokens: {e}")
 
     return {
         "ok": True,
         "smart_link": card["smart_link"],
-        "tokens": new_tokens,
+        "ad_tokens": new_tokens,
+        "tokens": new_tokens,  # Backward compat
         "votes_since_token": new_progress,
         "tokens_earned": tokens_earned,
     }
 
+@api_router.post("/cards/{card_id}/crypto-vote")
+def crypto_vote_card(card_id: str, payload: CryptoVoteRequest, user: dict = Depends(get_current_user)):
+    """Vote on crypto card with SOL"""
+    card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+    if card["owner_id"] == user["user_id"]:
+        raise HTTPException(status_code=400, detail="Cannot vote on your own card")
+    
+    card_type = _get_card_type(card)
+    if card_type != "crypto":
+        raise HTTPException(status_code=400, detail="Use /vote for SmartLink cards")
+    
+    expires_dt = _parse_dt(card["expires_at"])
+    if expires_dt < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Card has expired")
+
+    # Check Card Owner's service fee status
+    owner = _maybe(sb.table("users").select("*").eq("user_id", card["owner_id"]).maybe_single().execute())
+    if not owner or not owner.get("service_fee_paid"):
+        raise HTTPException(status_code=400, detail="Card owner's service fee is not current. Cannot vote.")
+    
+    # Check tx_hash not used
+    existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
+    if existing:
+        raise HTTPException(status_code=400, detail="Transaction already used")
+
+    # Record crypto vote
+    vote_cost = _get_vote_cost_sol(card)
+    now = datetime.now(timezone.utc)
+    
+    try:
+        sb.table("sol_transactions").insert({
+            "tx_id": f"cv_{uuid.uuid4().hex[:12]}",
+            "from_user_id": user["user_id"],
+            "to_user_id": card["owner_id"],
+            "tx_type": "vote_reward",
+            "amount_sol": vote_cost,
+            "tx_hash": payload.tx_hash,
+            "status": "confirmed",
+            "confirmed_at": now.isoformat()
+        }).execute()
+    except Exception as e:
+        logger.error(f"Failed to record sol transaction: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record transaction")
+    
+    # Update card votes
+    new_votes = card.get("votes", 0) + 1
+    try:
+        sb.table("cards").update({"votes": new_votes}).eq("card_id", card_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to update card votes: {e}")
+    
+    # Update owner SOL balance
+    try:
+        owner_sol_balance = _get_sol_balance(owner) if owner else 0.0
+        new_balance = owner_sol_balance + vote_cost
+        
+        sb.table("users").update({
+            "sol_balance": new_balance
+        }).eq("user_id", card["owner_id"]).execute()
+    except Exception as e:
+        logger.error(f"Failed to update SOL balance: {e}")
+
+    return {
+        "ok": True,
+        "votes": new_votes,
+        "amount_sol": vote_cost
+    }
+
+# ========= Referral =========
+@api_router.get("/referral/me")
+def referral_me(user: dict = Depends(get_current_user)):
+    return {
+        "referral_code": user.get("referral_code"),
+        "diamonds": user.get("diamonds", 0),
+        "diamond_boost_cost": DIAMOND_BOOST_COST,
+        "diamond_boost_minutes": DIAMOND_BOOST_MINUTES,
+    }
 
 # ========= Image Library =========
 SYSTEM_IMAGES = [
@@ -516,6 +968,7 @@ SYSTEM_IMAGES = [
 def image_library(user: dict = Depends(get_current_user)):
     return {"images": SYSTEM_IMAGES}
 
+<<<<<<< Updated upstream
 
 def _get_built_in_cards(count: int) -> list:
     sponsor_cards = [
@@ -877,6 +1330,8 @@ async def payfast_itn(request: Request):
     return {"ok": True}
 
 
+=======
+>>>>>>> Stashed changes
 # ========= App wiring =========
 app.include_router(api_router)
 
@@ -886,7 +1341,10 @@ app.add_middleware(
         "https://stokvel-cafbf.firebaseapp.com",
         "https://stokvel-cafbf.web.app",
         "http://localhost:3000",
-        "http://localhost:8000"
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "capacitor://localhost",
+        "http://localhost"
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -898,17 +1356,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-@app.on_event("startup")
-def backfill_user_fields():
-    try:
-        res = sb.table("users").select("user_id").is_("referral_code", "null").execute()
-        for u in (res.data or []):
-            sb.table("users").update({"referral_code": uuid.uuid4().hex[:8]}).eq("user_id", u["user_id"]).execute()
-    except Exception as e:
-        logger.warning("Backfill skipped: %s", e)
-
 
 if __name__ == "__main__":
     import uvicorn
