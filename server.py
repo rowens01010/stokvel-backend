@@ -32,15 +32,12 @@ VOTES_PER_TOKEN = 10
 INITIAL_AD_TOKENS = 3
 DIAMOND_BOOST_COST = 5
 DIAMOND_BOOST_MINUTES = 10
-FREE_CARDS_PER_USER = 1
-BUILT_IN_CARD_LIMIT = 20
 
 # Solana/Phantom Constants
 UPGRADE_COST_SOL = 0.012
 MONTHLY_SERVICE_FEE_SOL = 0.01
 DEFAULT_VOTE_COST_SOL = 0.001
 
-# System images for built-in cards
 SYSTEM_IMAGES = [
     "https://images.unsplash.com/photo-1723283126758-28f2a308bc47?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
     "https://images.unsplash.com/photo-1689154345830-861f74006b09?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
@@ -83,9 +80,8 @@ class CardCreate(BaseModel):
     smart_link: Optional[str] = ""
     title: Optional[str] = ""
     use_diamond_boost: Optional[bool] = False
-    card_type: Optional[str] = "smartlink"  # "smartlink" or "crypto"
+    card_type: Optional[str] = "smartlink"
     vote_cost_sol: Optional[float] = DEFAULT_VOTE_COST_SOL
-    wallet_address: Optional[str] = None  # For crypto cards
 
 class ConnectWalletRequest(BaseModel):
     wallet_address: str
@@ -264,7 +260,6 @@ def auth_logout(
 
 # ========= Service Fee Check =========
 def check_service_fee(user: dict):
-    """Check if user needs to pay monthly service fee"""
     if not user.get("is_upgraded"):
         return
     
@@ -295,7 +290,6 @@ def check_service_fee(user: dict):
 # ========= Wallet & Upgrade =========
 @api_router.post("/wallet/connect")
 def connect_wallet(payload: ConnectWalletRequest, user: dict = Depends(get_current_user)):
-    """Connect Phantom wallet"""
     sb.table("users").update({
         "wallet_address": payload.wallet_address
     }).eq("user_id", user["user_id"]).execute()
@@ -303,8 +297,6 @@ def connect_wallet(payload: ConnectWalletRequest, user: dict = Depends(get_curre
 
 @api_router.post("/upgrade/verify")
 def verify_upgrade(payload: UpgradeRequest, user: dict = Depends(get_current_user)):
-    """Verify upgrade payment (0.012 SOL)"""
-    
     if not user.get("wallet_address"):
         raise HTTPException(status_code=400, detail="Connect wallet first")
     
@@ -336,8 +328,6 @@ def verify_upgrade(payload: UpgradeRequest, user: dict = Depends(get_current_use
 
 @api_router.post("/service-fee/verify")
 def verify_service_fee(payload: ServiceFeeRequest, user: dict = Depends(get_current_user)):
-    """Verify monthly service fee (0.01 SOL)"""
-    
     if not user.get("is_upgraded"):
         raise HTTPException(status_code=400, detail="Not an upgraded user")
     
@@ -389,8 +379,6 @@ def _card_public(doc: dict) -> dict:
 
 @api_router.post("/cards")
 def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
-    """Create a card (smartlink or crypto)"""
-    
     card_type = payload.card_type
     
     if card_type == "crypto":
@@ -401,15 +389,10 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
         if not user.get("service_fee_paid"):
             raise HTTPException(status_code=402, detail="Service fee payment required")
         
-        # Use provided wallet or user's connected wallet
-        recipient_wallet = payload.wallet_address or user.get("wallet_address")
-        if not recipient_wallet:
-            raise HTTPException(status_code=400, detail="Wallet address required for crypto cards")
-        
         token_cost = 0
         smart_link = ""
+        recipient_wallet = user.get("wallet_address")
     else:
-        # SmartLink cards cost 1 ad_token
         if user.get("ad_tokens", 0) < 1:
             raise HTTPException(status_code=402, detail="Not enough ad tokens")
         token_cost = 1
@@ -440,18 +423,14 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
         "diamond_boosted": False,
         "card_type": card_type,
         "vote_cost_sol": payload.vote_cost_sol if card_type == "crypto" else 0.0,
-        "owner_wallet": recipient_wallet if card_type == "crypto" else None,
+        "owner_wallet": recipient_wallet,
     }
     sb.table("cards").insert(card).execute()
 
-    # Deduct token if SmartLink
     if token_cost > 0:
         new_tokens = user["ad_tokens"] - 1
-        sb.table("users").update({
-            "ad_tokens": new_tokens
-        }).eq("user_id", user["user_id"]).execute()
+        sb.table("users").update({"ad_tokens": new_tokens}).eq("user_id", user["user_id"]).execute()
     
-    # Deduct diamonds if boosted
     if payload.use_diamond_boost:
         new_diamonds = user.get("diamonds", 0) - DIAMOND_BOOST_COST
         sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
@@ -459,27 +438,31 @@ def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
     return _card_public(card)
 
 @api_router.get("/cards/marketplace")
-def get_marketplace(user: dict = Depends(get_current_user)):
-    """Get marketplace - free users see only smartlink cards, upgraded see all"""
+def get_marketplace(
+    user: dict = Depends(get_current_user),
+    filter_type: Optional[str] = None
+):
+    """Get marketplace. Free users see only smartlink. Upgraded users can filter."""
     now_iso = datetime.now(timezone.utc).isoformat()
     is_upgraded = user.get("is_upgraded", False)
     
     query = sb.table("cards").select("*").gt("expires_at", now_iso).neq("owner_id", user["user_id"])
     
     if not is_upgraded:
+        # Free users only see SmartLink cards
         query = query.or_("card_type.eq.smartlink,card_type.is.null")
+    elif filter_type and filter_type in ["smartlink", "crypto"]:
+        # Upgraded users can filter
+        if filter_type == "smartlink":
+            query = query.or_("card_type.eq.smartlink,card_type.is.null")
+        else:
+            query = query.eq("card_type", "crypto")
     
     res = query.limit(500).execute()
     cards = res.data or []
     random.shuffle(cards)
     
-    marketplace_cards = [_card_public(c) for c in cards[:12]]
-    
-    # Fill with built-in sponsor cards if needed
-    if len(marketplace_cards) < 12:
-        marketplace_cards.extend(_get_built_in_cards(12 - len(marketplace_cards)))
-    
-    return marketplace_cards[:12]
+    return [_card_public(c) for c in cards[:12]]
 
 @api_router.get("/cards/mine")
 def get_my_cards(user: dict = Depends(get_current_user)):
@@ -488,7 +471,6 @@ def get_my_cards(user: dict = Depends(get_current_user)):
 
 @api_router.post("/cards/{card_id}/vote")
 def vote_card(card_id: str, user: dict = Depends(get_current_user)):
-    """Vote on a SmartLink card (free vote)"""
     card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -499,8 +481,7 @@ def vote_card(card_id: str, user: dict = Depends(get_current_user)):
     if expires_dt < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Card has expired")
 
-    card_type = card.get("card_type", "smartlink")
-    if card_type == "crypto":
+    if card.get("card_type") == "crypto":
         raise HTTPException(status_code=400, detail="Use crypto-vote for crypto cards")
 
     sb.table("votes").insert({
@@ -534,27 +515,23 @@ def vote_card(card_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.post("/cards/{card_id}/crypto-vote")
 def crypto_vote_card(card_id: str, payload: CryptoVoteRequest, user: dict = Depends(get_current_user)):
-    """Vote on crypto card with SOL"""
     card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
     if card["owner_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot vote on your own card")
     
-    card_type = card.get("card_type", "smartlink")
-    if card_type != "crypto":
+    if card.get("card_type") != "crypto":
         raise HTTPException(status_code=400, detail="Use /vote for SmartLink cards")
     
     expires_dt = _parse_dt(card["expires_at"])
     if expires_dt < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Card has expired")
 
-    # Check card owner's service fee status
     owner = _maybe(sb.table("users").select("*").eq("user_id", card["owner_id"]).maybe_single().execute())
     if not owner or not owner.get("service_fee_paid"):
         raise HTTPException(status_code=400, detail="Card owner's service fee is not current")
     
-    # Check tx_hash not used
     existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
     if existing:
         raise HTTPException(status_code=400, detail="Transaction already used")
@@ -573,21 +550,15 @@ def crypto_vote_card(card_id: str, payload: CryptoVoteRequest, user: dict = Depe
         "confirmed_at": now.isoformat()
     }).execute()
     
-    # Update card votes
     new_votes = card.get("votes", 0) + 1
     sb.table("cards").update({"votes": new_votes}).eq("card_id", card_id).execute()
     
-    # Update owner SOL balance
     owner_sol = owner.get("sol_balance", 0) if owner else 0
     sb.table("users").update({
         "sol_balance": float(owner_sol) + vote_cost
     }).eq("user_id", card["owner_id"]).execute()
 
-    return {
-        "ok": True,
-        "votes": new_votes,
-        "amount_sol": vote_cost
-    }
+    return {"ok": True, "votes": new_votes, "amount_sol": vote_cost}
 
 # ========= Referral =========
 @api_router.get("/referral/me")
@@ -603,28 +574,6 @@ def referral_me(user: dict = Depends(get_current_user)):
 @api_router.get("/images/library")
 def image_library(user: dict = Depends(get_current_user)):
     return {"images": SYSTEM_IMAGES}
-
-# ========= Built-in Sponsor Cards =========
-def _get_built_in_cards(count: int) -> list:
-    sponsor_cards = []
-    for i in range(count):
-        sponsor_cards.append({
-            "card_id": f"sponsor_{uuid.uuid4().hex[:8]}",
-            "owner_id": "stokvel_sponsor",
-            "owner_name": "Stokvel Sponsor",
-            "image_url": SYSTEM_IMAGES[i % len(SYSTEM_IMAGES)],
-            "smart_link": "https://www.profitablecpmratenetwork.com/z0eydp85?key=eaa584ff9abd40f5a68179eb17df1f1f",
-            "title": f"Featured #{i+1}",
-            "votes": random.randint(100, 1000),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
-            "is_premium": True,
-            "diamond_boosted": False,
-            "card_type": "smartlink",
-            "vote_cost_sol": 0.0,
-            "owner_wallet": None,
-        })
-    return sponsor_cards
 
 # ========= PayFast =========
 def _payfast_signature(params: dict, passphrase: str = "") -> str:
